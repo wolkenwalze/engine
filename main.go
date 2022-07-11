@@ -171,7 +171,7 @@ func prettyPrintHTTPMonitor(step Step, result Result) {
         }
     }
     sort.SliceStable(keys, func(i, j int) bool {
-        return keys[i].After(keys[j])
+        return keys[i].Before(keys[j])
     })
     for len(keys) > 0 {
         subKeys := keys
