@@ -142,6 +142,8 @@ func printResult(step Step, result Result) {
     }
     name := step.Type
     switch step.Type {
+    case "sleep":
+        name = "Sleep"
     case "pod-kill":
         name = "Kill pod"
     case "http-monitor":
@@ -259,7 +261,10 @@ func stepExecutor(workPipe chan Step, resultPipe chan Result, lock *sync.Mutex, 
             return
         }
 
+        fmt.Printf("\033[37mExecuting %s step %s...\033[0m\n", step.Type, step.Id)
         switch step.Type {
+        case "sleep":
+            resultPipe <- executeSleep(step)
         case "pod-kill":
             resultPipe <- executePodKill(step)
         case "http-monitor":
@@ -267,17 +272,39 @@ func stepExecutor(workPipe chan Step, resultPipe chan Result, lock *sync.Mutex, 
         }
 
         lock.Lock()
-        for _, otherStep := range stepsByID {
-            for i := range otherStep.after {
-                if otherStep.after[i] == step.Id {
-                    otherStep.after = append(otherStep.after[:i], otherStep.after[:i+1]...)
+        for id, otherStep := range stepsByID {
+            newAfter := []string{}
+            for _, after := range otherStep.after {
+                if after != step.Id {
+                    newAfter = append(newAfter, after)
                 }
             }
+            otherStep.after = newAfter
+            stepsByID[id] = otherStep
         }
         lock.Unlock()
         wg.Done()
 
         enqueueNextSteps(lock, stepsByID, workPipe, wg)
+    }
+}
+
+func executeSleep(step Step) Result {
+    t, ok := step.Params["time"]
+    if !ok {
+        t = "10s"
+    }
+    d, err := time.ParseDuration(t)
+    if err != nil {
+        return Result{
+            Id:    step.Id,
+            Error: fmt.Sprintf("Invalid time: %s (%v)", t, err),
+        }
+    }
+    <-time.After(d)
+    return Result{
+        Id:      step.Id,
+        Success: true,
     }
 }
 
