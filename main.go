@@ -404,6 +404,7 @@ func executePodKill(step Step) (result Result) {
 
     target := possiblePods[0]
 
+    time.Sleep(time.Second)
     if err := clientset.CoreV1().Pods(target.Namespace).Delete(ctx, target.Name, v1.DeleteOptions{}); err != nil {
         result.Error = fmt.Sprintf("Failed to remove pod %s in namespace %s (%v)", target.Name, target.Namespace, err)
         return result
