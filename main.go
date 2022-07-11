@@ -7,11 +7,13 @@ import (
     "fmt"
     "io/ioutil"
     "log"
+    "math"
     "math/rand"
     "net/http"
     "os"
     "path/filepath"
     "regexp"
+    "sort"
     "sync"
     "time"
 
@@ -70,13 +72,17 @@ func main() {
         log.Fatal(err)
     }
 
-    stepsByID := map[string]*Step{}
+    stepsByID := map[string]Step{}
+    remainingStepsByID := map[string]Step{}
     for _, step := range w.Steps {
-        stepsByID[step.Id] = &step
+        stepsByID[step.Id] = step
+        remainingStepsByID[step.Id] = step
     }
     for id, step := range stepsByID {
         for _, nextStepID := range step.NextSteps {
-            stepsByID[nextStepID].after = append(stepsByID[nextStepID].after, id)
+            s := stepsByID[nextStepID]
+            s.after = append(s.after, id)
+            remainingStepsByID[nextStepID] = s
         }
     }
 
@@ -86,18 +92,27 @@ func main() {
     resultPipe := make(chan Result)
 
     for i := 0; i < 10; i++ {
-        go stepExecutor(workPipe, resultPipe, lock, wg, stepsByID)
+        go stepExecutor(workPipe, resultPipe, lock, wg, remainingStepsByID)
     }
 
+    exitCodeChan := make(chan int)
     go func() {
-        wg.Add(1)
         var results []Result
+        exitCode := 0
         for {
             result, ok := <-resultPipe
             if !ok {
                 break
             }
+            resultStep, ok := stepsByID[result.Id]
+            if !ok {
+                panic(fmt.Errorf("failed to find step %s", result.Id))
+            }
+            printResult(resultStep, result)
             results = append(results, result)
+            if !result.Success {
+                exitCode = 1
+            }
         }
         w.Results = results
 
@@ -109,16 +124,135 @@ func main() {
         if err := encoder.Encode(w); err != nil {
             log.Fatalf("Failed to write result file %s (%v)", outFile, err)
         }
+        exitCodeChan <- exitCode
     }()
 
-    enqueueNextSteps(lock, stepsByID, workPipe, wg)
+    enqueueNextSteps(lock, remainingStepsByID, workPipe, wg)
 
     wg.Wait()
-    close(workPipe)
     close(resultPipe)
+    exitCode := <-exitCodeChan
+    os.Exit(exitCode)
 }
 
-func stepExecutor(workPipe chan Step, resultPipe chan Result, lock *sync.Mutex, wg *sync.WaitGroup, stepsByID map[string]*Step) {
+func printResult(step Step, result Result) {
+    prefix := "\033[0;32m✅ "
+    if !result.Success {
+        prefix = "\033[0;31m❌ "
+    }
+    name := step.Type
+    switch step.Type {
+    case "pod-kill":
+        name = "Kill pod"
+    case "http-monitor":
+        name = "HTTP monitor"
+    }
+    fmt.Printf("::group::%s %s (%s)\033[0m\n", prefix, name, step.Id)
+    if result.Error != "" {
+        fmt.Printf("    %s\n", result.Error)
+    } else {
+        switch step.Type {
+        case "pod-kill":
+            prettyPrintPodKill(step, result)
+        case "http-monitor":
+            prettyPrintHTTPMonitor(step, result)
+        }
+    }
+    fmt.Printf("::endgroup::\n")
+}
+
+func prettyPrintHTTPMonitor(step Step, result Result) {
+    maxLatency := 1
+    var keys []time.Time
+    for t, l := range result.HTTPMonitorResult.Latencies {
+        keys = append(keys, t)
+        if l > maxLatency {
+            maxLatency = l
+        }
+    }
+    sort.SliceStable(keys, func(i, j int) bool {
+        return keys[i].After(keys[j])
+    })
+    for len(keys) > 0 {
+        subKeys := keys
+        if len(subKeys) > 70 {
+            subKeys = keys[0:70]
+        }
+        keys = keys[len(subKeys):]
+        prettyPrintLatencyGraph(subKeys, maxLatency, result.HTTPMonitorResult.Latencies)
+    }
+}
+
+func prettyPrintLatencyGraph(times []time.Time, maxLatency int, latencies map[time.Time]int) {
+    fmt.Printf("%11s", fmt.Sprintf("%d ms ▲\n", int(math.Ceil(float64(maxLatency)/10000000))))
+    increment := maxLatency / 80
+    blocks := map[int]string{
+        0: " ",
+        1: "▁",
+        2: "▂",
+        3: "▃",
+        4: "▄",
+        5: "▅",
+        6: "▆",
+        7: "▇",
+        8: "█",
+    }
+    for i := 10; i > 0; i-- {
+        fmt.Printf("         ┃")
+        if i > 7 {
+            fmt.Print("\033[31m")
+        } else if i > 5 {
+            fmt.Print("\033[33m")
+        } else {
+            fmt.Print("\033[32m")
+        }
+
+        for j := 0; j < len(times); j++ {
+            latency := latencies[times[j]]
+            if latency == 0 {
+                fmt.Print("\033[31m╳")
+                if i > 7 {
+                    fmt.Print("\033[31m")
+                } else if i > 5 {
+                    fmt.Print("\033[33m")
+                } else {
+                    fmt.Print("\033[32m")
+                }
+            } else {
+                incrementsUsed := latency / increment
+                block := int(math.Min(math.Max(float64((incrementsUsed)-((i-1)*8)), 0), 8))
+                fmt.Print(blocks[block])
+            }
+        }
+        fmt.Print("\033[0m\n")
+    }
+    fmt.Printf("    0 ms ┗")
+    for i := 0; i < len(times); i++ {
+        if latencies[times[i]] == 0 {
+            fmt.Print("\033[31m━\033[0m")
+        } else {
+            fmt.Print("━")
+        }
+    }
+    fmt.Print("▶\n")
+    timeFormat := "2006-01-02 15:04:05"
+    timeOutput := fmt.Sprintf("         %s", times[0].Format(timeFormat))
+    if len(timeOutput)+len(timeFormat) < 10+len(times)+2 {
+        startLength := len(timeOutput)
+        targetLength := 10 + len(times) - len(timeFormat)
+        for i := startLength; i < targetLength; i++ {
+            timeOutput += " "
+        }
+        timeOutput += fmt.Sprintf("%s", times[len(times)-1].Format(timeFormat))
+    }
+    fmt.Print(timeOutput + "\n\n")
+}
+
+func prettyPrintPodKill(step Step, result Result) {
+    fmt.Printf("    ☠  Namespace: \033[1m%s\033[0m Pod: \033[1m%s\033[0m\n", result.PodNamespace, result.PodName)
+}
+
+func stepExecutor(workPipe chan Step, resultPipe chan Result, lock *sync.Mutex, wg *sync.WaitGroup, stepsByID map[string]Step) {
     for {
         step, ok := <-workPipe
         if !ok {
@@ -131,7 +265,6 @@ func stepExecutor(workPipe chan Step, resultPipe chan Result, lock *sync.Mutex, 
         case "http-monitor":
             resultPipe <- executeHTTPMonitor(step)
         }
-        wg.Done()
 
         lock.Lock()
         for _, otherStep := range stepsByID {
@@ -142,6 +275,7 @@ func stepExecutor(workPipe chan Step, resultPipe chan Result, lock *sync.Mutex, 
             }
         }
         lock.Unlock()
+        wg.Done()
 
         enqueueNextSteps(lock, stepsByID, workPipe, wg)
     }
@@ -274,23 +408,37 @@ func executePodKill(step Step) (result Result) {
         result.Error = fmt.Sprintf("Failed to remove pod %s in namespace %s (%v)", target.Name, target.Namespace, err)
         return result
     }
+    result.Success = true
     result.PodName = target.Name
     result.PodNamespace = target.Namespace
     return result
 }
 
-func enqueueNextSteps(lock *sync.Mutex, steps map[string]*Step, pipe chan Step, wg *sync.WaitGroup) {
+func enqueueNextSteps(lock *sync.Mutex, steps map[string]Step, pipe chan Step, wg *sync.WaitGroup) {
     lock.Lock()
-    var result []*Step
+    if len(steps) == 0 {
+        lock.Unlock()
+        return
+    }
+    var result []Step
     for _, step := range steps {
         if len(step.after) == 0 {
-            delete(steps, step.Id)
             result = append(result, step)
         }
     }
+    for _, step := range result {
+        delete(steps, step.Id)
+    }
+    closeChannel := false
+    if len(steps) == 0 {
+        closeChannel = true
+    }
+    wg.Add(len(result))
     lock.Unlock()
     for _, step := range result {
-        wg.Add(1)
-        pipe <- *step
+        pipe <- step
+    }
+    if closeChannel {
+        close(pipe)
     }
 }
