@@ -33,7 +33,7 @@ type Step struct {
 }
 
 type Result struct {
-    Id                string `json:"result"`
+    Id                string `json:"-"`
     Success           bool   `json:"success"`
     Error             string `json:"error"`
     HTTPMonitorResult `json:",inline"`
@@ -50,9 +50,9 @@ type PodKillResult struct {
 }
 
 type Workflow struct {
-    InitialSteps []string `json:"initialSteps"`
-    Steps        []Step   `json:"steps"`
-    Results      []Result `json:"result"`
+    InitialSteps []string          `json:"initialSteps"`
+    Steps        []Step            `json:"steps"`
+    Results      map[string]Result `json:"result"`
 }
 
 func main() {
@@ -97,7 +97,7 @@ func main() {
 
     exitCodeChan := make(chan int)
     go func() {
-        var results []Result
+        var results map[string]Result
         exitCode := 0
         for {
             result, ok := <-resultPipe
@@ -109,7 +109,7 @@ func main() {
                 panic(fmt.Errorf("failed to find step %s", result.Id))
             }
             printResult(resultStep, result)
-            results = append(results, result)
+            results[result.Id] = result
             if !result.Success {
                 exitCode = 1
             }
