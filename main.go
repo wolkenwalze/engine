@@ -97,7 +97,7 @@ func main() {
 
     exitCodeChan := make(chan int)
     go func() {
-        var results map[string]Result
+        results := map[string]Result{}
         exitCode := 0
         for {
             result, ok := <-resultPipe
